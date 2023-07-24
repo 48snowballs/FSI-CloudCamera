@@ -14,7 +14,7 @@ mqtt:
   enabled: False
 
 cameras:
-  camera_1: # <------ Name the camera
+  name_of_your_camera: # <------ Name the camera
     ffmpeg:
       inputs:
         - path: rtsp://10.0.10.10:554/rtsp # <----- The stream you want to use for detection
@@ -22,8 +22,6 @@ cameras:
             - detect
     detect:
       enabled: False # <---- disable detection until you have a working camera feed
-      width: 1280 # <---- update for your camera's resolution
-      height: 720 # <---- update for your camera's resolution
 ```
 
 ### Step 2: Start Frigate
@@ -44,7 +42,7 @@ Here is an example configuration with hardware acceleration configured for Intel
 mqtt: ...
 
 cameras:
-  camera_1:
+  name_of_your_camera:
     ffmpeg:
       inputs: ...
       hwaccel_args: preset-vaapi
@@ -64,14 +62,14 @@ detectors: # <---- add detectors
     device: usb
 
 cameras:
-  camera_1:
+  name_of_your_camera:
     ffmpeg: ...
     detect:
       enabled: True # <---- turn on detection
       ...
 ```
 
-More details on available detectors can be found [here](../configuration/detectors.md).
+More details on available detectors can be found [here](../configuration/object_detectors.md).
 
 Restart Frigate and you should start seeing detections for `person`. If you want to track other objects, they will need to be added according to the [configuration file reference](../configuration/index.md#full-configuration-reference).
 
@@ -99,15 +97,12 @@ detectors:
     device: usb
 
 cameras:
-  camera_1:
+  name_of_your_camera:
     ffmpeg:
       inputs:
         - path: rtsp://10.0.10.10:554/rtsp
           roles:
             - detect
-    detect:
-      width: 1280
-      height: 720
     motion:
       mask:
         - 0,461,3,0,1919,0,1919,843,1699,492,1344,458,1346,336,973,317,869,375,866,432
@@ -127,7 +122,7 @@ mqtt: ...
 detectors: ...
 
 cameras:
-  camera_1:
+  name_of_your_camera:
     ffmpeg:
       inputs:
         - path: rtsp://10.0.10.10:554/rtsp
@@ -156,7 +151,7 @@ mqtt: ...
 detectors: ...
 
 cameras:
-  camera_1: ...
+  name_of_your_camera: ...
     detect: ...
     record: ...
     snapshots: # <----- Enable snapshots

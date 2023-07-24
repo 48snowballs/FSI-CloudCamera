@@ -11,6 +11,7 @@ services:
     shm_size: "256mb"
     build:
       context: .
+      dockerfile: docker/main/Dockerfile
       # Use target devcontainer-trt for TensorRT dev
       target: devcontainer
     deploy:
@@ -27,7 +28,7 @@ services:
       - .:/workspace/frigate:cached
       - ./web/dist:/opt/frigate/web:cached
       - /etc/localtime:/etc/localtime:ro
-      - ./config/config.yml:/config/config.yml:ro
+      - ./config:/config
       - ./debug:/media/frigate
       # Create the trt-models folder using the documented method of generating TRT models
       # - ./debug/trt-models:/trt-models

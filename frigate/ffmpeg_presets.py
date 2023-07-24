@@ -2,13 +2,11 @@
 
 import logging
 import os
-
+from enum import Enum
 from typing import Any
 
+from frigate.util.services import vainfo_hwaccel
 from frigate.version import VERSION
-from frigate.const import BTBN_PATH
-from frigate.util import vainfo_hwaccel
-
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +42,11 @@ class LibvaGpuSelector:
         return ""
 
 
-TIMEOUT_PARAM = "-timeout" if os.path.exists(BTBN_PATH) else "-stimeout"
+TIMEOUT_PARAM = (
+    "-timeout"
+    if int(os.getenv("LIBAVFORMAT_VERSION_MAJOR", "59")) >= 59
+    else "-stimeout"
+)
 
 _gpu_selector = LibvaGpuSelector()
 _user_agent_args = [
@@ -53,8 +55,8 @@ _user_agent_args = [
 ]
 
 PRESETS_HW_ACCEL_DECODE = {
-    "preset-rpi-32-h264": ["-c:v", "h264_v4l2m2m"],
-    "preset-rpi-64-h264": ["-c:v", "h264_v4l2m2m"],
+    "preset-rpi-32-h264": ["-c:v:1", "h264_v4l2m2m"],
+    "preset-rpi-64-h264": ["-c:v:1", "h264_v4l2m2m"],
     "preset-vaapi": [
         "-hwaccel_flags",
         "allow_profile_mismatch",
@@ -108,17 +110,17 @@ PRESETS_HW_ACCEL_DECODE = {
 }
 
 PRESETS_HW_ACCEL_SCALE = {
-    "preset-rpi-32-h264": "-r {0} -s {1}x{2}",
-    "preset-rpi-64-h264": "-r {0} -s {1}x{2}",
+    "preset-rpi-32-h264": "-r {0} -vf fps={0},scale={1}:{2}",
+    "preset-rpi-64-h264": "-r {0} -vf fps={0},scale={1}:{2}",
     "preset-vaapi": "-r {0} -vf fps={0},scale_vaapi=w={1}:h={2},hwdownload,format=yuv420p",
     "preset-intel-qsv-h264": "-r {0} -vf vpp_qsv=framerate={0}:w={1}:h={2}:format=nv12,hwdownload,format=nv12,format=yuv420p",
     "preset-intel-qsv-h265": "-r {0} -vf vpp_qsv=framerate={0}:w={1}:h={2}:format=nv12,hwdownload,format=nv12,format=yuv420p",
     "preset-nvidia-h264": "-r {0} -vf fps={0},scale_cuda=w={1}:h={2}:format=nv12,hwdownload,format=nv12,format=yuv420p",
     "preset-nvidia-h265": "-r {0} -vf fps={0},scale_cuda=w={1}:h={2}:format=nv12,hwdownload,format=nv12,format=yuv420p",
-    "default": "-r {0} -s {1}x{2}",
+    "default": "-r {0} -vf fps={0},scale={1}:{2}",
 }
 
-PRESETS_HW_ACCEL_ENCODE = {
+PRESETS_HW_ACCEL_ENCODE_BIRDSEYE = {
     "preset-rpi-32-h264": "ffmpeg -hide_banner {0} -c:v h264_v4l2m2m {1}",
     "preset-rpi-64-h264": "ffmpeg -hide_banner {0} -c:v h264_v4l2m2m {1}",
     "preset-vaapi": "ffmpeg -hide_banner -hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device {2} {0} -c:v h264_vaapi -g 50 -bf 0 -profile:v high -level:v 4.1 -sei:v 0 -an -vf format=vaapi|nv12,hwupload {1}",
@@ -127,6 +129,17 @@ PRESETS_HW_ACCEL_ENCODE = {
     "preset-nvidia-h264": "ffmpeg -hide_banner {0} -c:v h264_nvenc -g 50 -profile:v high -level:v auto -preset:v p2 -tune:v ll {1}",
     "preset-nvidia-h265": "ffmpeg -hide_banner {0} -c:v h264_nvenc -g 50 -profile:v high -level:v auto -preset:v p2 -tune:v ll {1}",
     "default": "ffmpeg -hide_banner {0} -c:v libx264 -g 50 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency {1}",
+}
+
+PRESETS_HW_ACCEL_ENCODE_TIMELAPSE = {
+    "preset-rpi-32-h264": "ffmpeg -hide_banner {0} -c:v h264_v4l2m2m {1}",
+    "preset-rpi-64-h264": "ffmpeg -hide_banner {0} -c:v h264_v4l2m2m {1}",
+    "preset-vaapi": "ffmpeg -hide_banner -hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device {2} {0} -c:v h264_vaapi {1}",
+    "preset-intel-qsv-h264": "ffmpeg -hide_banner {0} -c:v h264_qsv -g 50 -bf 0 -profile:v high -level:v 4.1 -async_depth:v 1 {1}",
+    "preset-intel-qsv-h265": "ffmpeg -hide_banner {0} -c:v hevc_qsv -g 50 -bf 0 -profile:v high -level:v 4.1 -async_depth:v 1 {1}",
+    "preset-nvidia-h264": "ffmpeg -hide_banner -hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 8 {0} -c:v h264_nvenc {1}",
+    "preset-nvidia-h265": "ffmpeg -hide_banner -hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 8 {0} -c:v hevc_nvenc {1}",
+    "default": "ffmpeg -hide_banner {0} -c:v libx264 -preset:v ultrafast -tune:v zerolatency {1}",
 }
 
 
@@ -163,12 +176,24 @@ def parse_preset_hardware_acceleration_scale(
         return scale
 
 
-def parse_preset_hardware_acceleration_encode(arg: Any, input: str, output: str) -> str:
-    """Return the correct scaling preset or default preset if none is set."""
-    if not isinstance(arg, str):
-        return PRESETS_HW_ACCEL_ENCODE["default"].format(input, output)
+class EncodeTypeEnum(str, Enum):
+    birdseye = "birdseye"
+    timelapse = "timelapse"
 
-    return PRESETS_HW_ACCEL_ENCODE.get(arg, PRESETS_HW_ACCEL_ENCODE["default"]).format(
+
+def parse_preset_hardware_acceleration_encode(
+    arg: Any, input: str, output: str, type: EncodeTypeEnum = EncodeTypeEnum.birdseye
+) -> str:
+    """Return the correct scaling preset or default preset if none is set."""
+    if type == EncodeTypeEnum.birdseye:
+        arg_map = PRESETS_HW_ACCEL_ENCODE_BIRDSEYE
+    elif type == EncodeTypeEnum.timelapse:
+        arg_map = PRESETS_HW_ACCEL_ENCODE_TIMELAPSE
+
+    if not isinstance(arg, str):
+        return arg_map["default"].format(input, output)
+
+    return arg_map.get(arg, arg_map["default"]).format(
         input,
         output,
         _gpu_selector.get_selected_gpu(),
@@ -260,6 +285,13 @@ PRESETS_INPUT = {
         "-use_wallclock_as_timestamps",
         "1",
     ],
+    "preset-rtsp-audio-only": [
+        "-rtsp_transport",
+        "tcp",
+        TIMEOUT_PARAM,
+        "5000000",
+        "-vn",
+    ],
     "preset-rtsp-restream": _user_agent_args
     + [
         "-rtsp_transport",
@@ -320,7 +352,7 @@ def parse_preset_input(arg: Any, detect_fps: int) -> list[str]:
 
     if arg == "preset-http-jpeg-generic":
         input = PRESETS_INPUT[arg].copy()
-        input[1] = str(detect_fps)
+        input[len(_user_agent_args) + 1] = str(detect_fps)
         return input
 
     return PRESETS_INPUT.get(arg, None)

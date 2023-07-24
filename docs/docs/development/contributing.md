@@ -1,6 +1,6 @@
 ---
 id: contributing
-title: Contributing
+title: Contributing To The Main Code Base
 ---
 
 ## Getting the source
@@ -36,7 +36,13 @@ Fork [blakeblackshear/frigate-hass-integration](https://github.com/blakeblackshe
 - [Frigate source code](#frigate-core-web-and-docs)
 - GNU make
 - Docker
-- Extra Coral device (optional, but very helpful to simulate real world performance)
+- An extra detector (Coral, OpenVINO, etc.) is optional but recommended to simulate real world performance.
+
+:::note
+
+A Coral device can only be used by a single process at a time, so an extra Coral device is recommended if using a coral for development purposes.
+
+:::
 
 ### Setup
 
@@ -62,10 +68,6 @@ cameras:
           input_args: -re -stream_loop -1 -fflags +genpts
           roles:
             - detect
-    detect:
-      height: 1080
-      width: 1920
-      fps: 5
 ```
 
 These input args tell ffmpeg to read the mp4 file in an infinite loop. You can use any valid ffmpeg input here.
@@ -79,7 +81,7 @@ Create and place these files in a `debug` folder in the root of the repo. This i
 VSCode will start the docker compose file for you and open a terminal window connected to `frigate-dev`.
 
 - Run `python3 -m frigate` to start the backend.
-- In a separate terminal window inside VS Code, change into the `web` directory and run `npm install && npm start` to start the frontend.
+- In a separate terminal window inside VS Code, change into the `web` directory and run `npm install && npm run dev` to start the frontend.
 
 #### 5. Teardown
 

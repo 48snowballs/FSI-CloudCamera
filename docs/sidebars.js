@@ -16,7 +16,8 @@ module.exports = {
     ],
     Configuration: [
       "configuration/index",
-      "configuration/detectors",
+      "configuration/object_detectors",
+      "configuration/audio_detectors",
       "configuration/cameras",
       "configuration/masks",
       "configuration/record",
@@ -44,6 +45,7 @@ module.exports = {
     ],
     Development: [
       "development/contributing",
+      "development/contributing-boards"
     ],
   },
 };

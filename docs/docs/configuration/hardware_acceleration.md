@@ -5,7 +5,9 @@ title: Hardware Acceleration
 
 It is recommended to update your configuration to enable hardware accelerated decoding in ffmpeg. Depending on your system, these parameters may not be compatible. More information on hardware accelerated decoding for ffmpeg can be found here: https://trac.ffmpeg.org/wiki/HWAccelIntro
 
-### Raspberry Pi 3/4
+# Officially Supported
+
+## Raspberry Pi 3/4
 
 Ensure you increase the allocated RAM for your GPU to at least 128 (raspi-config > Performance Options > GPU Memory).
 **NOTICE**: If you are using the addon, you may need to turn off `Protection mode` for hardware acceleration.
@@ -15,7 +17,23 @@ ffmpeg:
   hwaccel_args: preset-rpi-64-h264
 ```
 
-### Intel-based CPUs (<10th Generation) via VAAPI
+:::note
+
+If running Frigate in docker, you either need to run in priviliged mode or be sure to map the /dev/video1x devices to Frigate
+
+```yaml
+docker run -d \
+  --name frigate \
+  ...
+  --device /dev/video10 \
+  ghcr.io/blakeblackshear/frigate:stable
+```
+
+:::
+
+## Intel-based CPUs
+
+### Via VAAPI
 
 VAAPI supports automatic profile selection so it will work automatically with both H.264 and H.265 streams. VAAPI is recommended for all generations of Intel-based CPUs if QSV does not work.
 
@@ -24,9 +42,9 @@ ffmpeg:
   hwaccel_args: preset-vaapi
 ```
 
-**NOTICE**: With some of the processors, like the J4125, the default driver `iHD` doesn't seem to work correctly for hardware acceleration. You may need to change the driver to `i965` by adding the following environment variable `LIBVA_DRIVER_NAME=i965` to your docker-compose file or [in the frigate.yml for HA OS users](advanced.md#environment_vars).
+**NOTICE**: With some of the processors, like the J4125, the default driver `iHD` doesn't seem to work correctly for hardware acceleration. You may need to change the driver to `i965` by adding the following environment variable `LIBVA_DRIVER_NAME=i965` to your docker-compose file or [in the `frigate.yaml` for HA OS users](advanced.md#environment_vars).
 
-### Intel-based CPUs (>=10th Generation) via Quicksync
+### Via Quicksync (>=10th Generation only)
 
 QSV must be set specifically based on the video encoding of the stream.
 
@@ -44,7 +62,72 @@ ffmpeg:
   hwaccel_args: preset-intel-qsv-h265
 ```
 
-### AMD/ATI GPUs (Radeon HD 2000 and newer GPUs) via libva-mesa-driver
+### Configuring Intel GPU Stats in Docker
+
+Additional configuration is needed for the Docker container to be able to access the `intel_gpu_top` command for GPU stats. Three possible changes can be made:
+
+1. Run the container as privileged.
+2. Adding the `CAP_PERFMON` capability.
+3. Setting the `perf_event_paranoid` low enough to allow access to the performance event system.
+
+#### Run as privileged
+
+This method works, but it gives more permissions to the container than are actually needed.
+
+##### Docker Compose - Privileged
+
+```yaml
+services:
+  frigate:
+    ...
+    image: ghcr.io/blakeblackshear/frigate:stable
+    privileged: true
+```
+
+##### Docker Run CLI - Privileged
+
+```bash
+docker run -d \
+  --name frigate \
+  ...
+  --privileged \
+  ghcr.io/blakeblackshear/frigate:stable
+```
+
+#### CAP_PERFMON
+
+Only recent versions of Docker support the `CAP_PERFMON` capability. You can test to see if yours supports it by running: `docker run --cap-add=CAP_PERFMON hello-world`
+
+##### Docker Compose - CAP_PERFMON
+
+```yaml
+services:
+  frigate:
+    ...
+    image: ghcr.io/blakeblackshear/frigate:stable
+    cap_add:
+      - CAP_PERFMON
+```
+
+##### Docker Run CLI - CAP_PERFMON
+
+```bash
+docker run -d \
+  --name frigate \
+  ...
+  --cap-add=CAP_PERFMON \
+  ghcr.io/blakeblackshear/frigate:stable
+```
+
+#### perf_event_paranoid
+
+_Note: This setting must be changed for the entire system._
+
+For more information on the various values across different distributions, see https://askubuntu.com/questions/1400874/what-does-perf-paranoia-level-four-do.
+
+Depending on your OS and kernel configuration, you may need to change the `/proc/sys/kernel/perf_event_paranoid` kernel tunable. You can test the change by running `sudo sh -c 'echo 2 >/proc/sys/kernel/perf_event_paranoid'` which will persist until a reboot. Make it permanent by running `sudo sh -c 'echo kernel.perf_event_paranoid=1 >> /etc/sysctl.d/local.conf'`
+
+## AMD/ATI GPUs (Radeon HD 2000 and newer GPUs) via libva-mesa-driver
 
 VAAPI supports automatic profile selection so it will work automatically with both H.264 and H.265 streams.
 
@@ -55,19 +138,19 @@ ffmpeg:
   hwaccel_args: preset-vaapi
 ```
 
-### NVIDIA GPUs
+## NVIDIA GPUs
 
 While older GPUs may work, it is recommended to use modern, supported GPUs. NVIDIA provides a [matrix of supported GPUs and features](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new). If your card is on the list and supports CUVID/NVDEC, it will most likely work with Frigate for decoding. However, you must also use [a driver version that will work with FFmpeg](https://github.com/FFmpeg/nv-codec-headers/blob/master/README). Older driver versions may be missing symbols and fail to work, and older cards are not supported by newer driver versions. The only way around this is to [provide your own FFmpeg](/configuration/advanced#custom-ffmpeg-build) that will work with your driver version, but this is unsupported and may not work well if at all.
 
-A more complete list of cards and ther compatible drivers is available in the [driver release readme](https://download.nvidia.com/XFree86/Linux-x86_64/525.85.05/README/supportedchips.html).
+A more complete list of cards and their compatible drivers is available in the [driver release readme](https://download.nvidia.com/XFree86/Linux-x86_64/525.85.05/README/supportedchips.html).
 
 If your distribution does not offer NVIDIA driver packages, you can [download them here](https://www.nvidia.com/en-us/drivers/unix/).
 
-#### Docker Configuration
+### Configuring Nvidia GPUs in Docker
 
 Additional configuration is needed for the Docker container to be able to access the NVIDIA GPU. The supported method for this is to install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker) and specify the GPU to Docker. How you do this depends on how Docker is being run:
 
-##### Docker Compose
+#### Docker Compose - Nvidia GPU
 
 ```yaml
 services:
@@ -84,7 +167,7 @@ services:
               capabilities: [gpu]
 ```
 
-##### Docker Run CLI
+#### Docker Run CLI - Nvidia GPU
 
 ```bash
 docker run -d \
@@ -94,7 +177,7 @@ docker run -d \
   ghcr.io/blakeblackshear/frigate:stable
 ```
 
-#### Setup Decoder
+### Setup Decoder
 
 The decoder you need to pass in the `hwaccel_args` will depend on the input video.
 
@@ -161,3 +244,5 @@ processes:
 If you do not see these processes, check the `docker logs` for the container and look for decoding errors.
 
 These instructions were originally based on the [Jellyfin documentation](https://jellyfin.org/docs/general/administration/hardware-acceleration.html#nvidia-hardware-acceleration-on-docker-linux).
+
+# Community Supported
