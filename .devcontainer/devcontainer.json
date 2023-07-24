@@ -1,5 +1,5 @@
 {
-  "name": "Frigate Devcontainer",
+  "name": "CloudCamera Devcontainer",
   "dockerComposeFile": "../docker-compose.yml",
   "service": "devcontainer",
   "workspaceFolder": "/workspace/frigate",
