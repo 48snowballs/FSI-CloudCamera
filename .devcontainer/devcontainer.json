@@ -6,8 +6,9 @@
   "initializeCommand": ".devcontainer/initialize.sh",
   "postCreateCommand": ".devcontainer/post_create.sh",
   "overrideCommand": false,
-  "remoteUser": "duongpt-vscode",
-  "remoteEnv": { "HOME": "" },
+  "remoteUser": "root",
+  // "remoteEnv": { "HOME": "" },
+  // "containerUser": "vscode",
   "features": {
     "ghcr.io/devcontainers/features/common-utils:1": {}
   },
