@@ -7,7 +7,6 @@ import threading
 from types import FrameType
 from typing import Optional
 
-import faster_fifo as ff
 from playhouse.sqliteq import SqliteQueueDatabase
 from setproctitle import setproctitle
 
@@ -23,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 def manage_recordings(
     config: FrigateConfig,
-    recordings_info_queue: ff.Queue,
+    object_recordings_info_queue: mp.Queue,
+    audio_recordings_info_queue: mp.Queue,
     process_info: dict[str, FeatureMetricsTypes],
 ) -> None:
     stop_event = mp.Event()
@@ -45,13 +45,17 @@ def manage_recordings(
             "cache_size": -512 * 1000,  # 512MB of cache
             "synchronous": "NORMAL",  # Safe when using WAL https://www.sqlite.org/pragma.html#pragma_synchronous
         },
-        timeout=60,
+        timeout=max(60, 10 * len([c for c in config.cameras.values() if c.enabled])),
     )
     models = [Event, Recordings, Timeline, RecordingsToDelete]
     db.bind(models)
 
     maintainer = RecordingMaintainer(
-        config, recordings_info_queue, process_info, stop_event
+        config,
+        object_recordings_info_queue,
+        audio_recordings_info_queue,
+        process_info,
+        stop_event,
     )
     maintainer.start()
 

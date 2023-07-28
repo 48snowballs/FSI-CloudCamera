@@ -19,9 +19,6 @@ cameras:
         - path: rtsp://viewer:{FRIGATE_RTSP_PASSWORD}@10.0.10.10:554/cam/realmonitor?channel=1&subtype=2
           roles:
             - detect
-    detect:
-      width: 1280
-      height: 720
 ```
 
 ### VSCode Configuration Schema
@@ -157,6 +154,12 @@ audio:
     - scream
     - speech
     - yell
+  # Optional: Filters to configure detection.
+  filters:
+    # Label that matches label in listen config.
+    speech:
+      # Minimum score that triggers an audio event (default: shown below)
+      threshold: 0.8
 
 # Optional: logger verbosity settings
 logger:
@@ -344,6 +347,8 @@ record:
   # Optional: Number of minutes to wait between cleanup runs (default: shown below)
   # This can be used to reduce the frequency of deleting recording segments from disk if you want to minimize i/o
   expire_interval: 60
+  # Optional: Sync recordings with disk on startup (default: shown below).
+  sync_on_startup: False
   # Optional: Retention settings for recording
   retain:
     # Optional: Number of days to retain recordings regardless of events (default: shown below)
@@ -418,7 +423,7 @@ rtmp:
   enabled: False
 
 # Optional: Restream configuration
-# Uses https://github.com/AlexxIT/go2rtc (v1.5.0)
+# Uses https://github.com/AlexxIT/go2rtc (v1.6.2)
 go2rtc:
 
 # Optional: jsmpeg stream configuration for WebUI
