@@ -28,7 +28,7 @@ from flask import (
     request,
 )
 
-from peewee import SqliteDatabase, operator, fn, DoesNotExist
+from peewee import SqliteDatabase, operator, fn, DoesNotExist, MySQLDatabase
 from playhouse.shortcuts import model_to_dict
 
 from frigate.config import FrigateConfig
@@ -53,7 +53,7 @@ bp = Blueprint("frigate", __name__)
 
 def create_app(
     frigate_config,
-    database: SqliteDatabase,
+    database: MySQLDatabase,
     stats_tracking,
     detected_frames_processor,
     storage_maintainer: StorageMaintainer,
@@ -65,11 +65,13 @@ def create_app(
     def _db_connect():
         if database.is_closed():
             database.connect()
+        # database = MySQLDatabase(self.config.mysqldb.db, user=self.config.mysqldb.user, password=self.config.mysqldb.password, host=self.config.mysqldb.host, port=self.config.mysqldb.port)    
 
     @app.teardown_request
     def _db_close(exc):
         if not database.is_closed():
-            database.close()
+            database.close() 
+
 
     app.frigate_config = frigate_config
     app.stats_tracking = stats_tracking
@@ -95,7 +97,6 @@ def events_summary():
     hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
     has_clip = request.args.get("has_clip", type=int)
     has_snapshot = request.args.get("has_snapshot", type=int)
-
     clauses = []
 
     if not has_clip is None:
@@ -111,11 +112,11 @@ def events_summary():
         Event.select(
             Event.camera,
             Event.label,
-            fn.strftime(
-                "%Y-%m-%d",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            Event.sub_label,
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("day"),
             Event.zones,
             fn.COUNT(Event.id).alias("count"),
@@ -124,11 +125,12 @@ def events_summary():
         .group_by(
             Event.camera,
             Event.label,
-            fn.strftime(
-                "%Y-%m-%d",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            Event.sub_label,
+            fn.DATE_FORMAT(
+
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ),
             Event.zones,
         )
@@ -184,6 +186,18 @@ def send_to_plus(id):
         logger.error(message)
         return make_response(jsonify({"success": False, "message": message}), 404)
 
+    if event.end_time is None:
+        logger.error(f"Unable to load clean png for in-progress event: {event.id}")
+        return make_response(
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Unable to load clean png for in-progress event",
+                }
+            ),
+            400,
+        )
+
     if event.plus_id:
         message = "Already submitted to plus"
         logger.error(message)
@@ -194,6 +208,15 @@ def send_to_plus(id):
         filename = f"{event.camera}-{event.id}-clean.png"
         image = cv2.imread(os.path.join(CLIPS_DIR, filename))
     except Exception:
+        logger.error(f"Unable to load clean png for event: {event.id}")
+        return make_response(
+            jsonify(
+                {"success": False, "message": "Unable to load clean png for event"}
+            ),
+            400,
+        )
+
+    if image is None or image.size == 0:
         logger.error(f"Unable to load clean png for event: {event.id}")
         return make_response(
             jsonify(
@@ -301,7 +324,9 @@ def get_sub_labels():
         sub_labels.remove(None)
 
     if split_joined:
-        for label in sub_labels:
+        original_labels = sub_labels.copy()
+
+        for label in original_labels:
             if "," in label:
                 sub_labels.remove(label)
                 parts = label.split(",")
@@ -310,6 +335,7 @@ def get_sub_labels():
                     if not (part.strip()) in sub_labels:
                         sub_labels.append(part.strip())
 
+    sub_labels.sort()
     return jsonify(sub_labels)
 
 
@@ -617,7 +643,13 @@ def events():
             sub_label_clauses.append((Event.sub_label.is_null()))
 
         for label in filtered_sub_labels:
-            sub_label_clauses.append((Event.sub_label.cast("text") % f"*{label}*"))
+            sub_label_clauses.append(
+                (Event.sub_label.cast("char") == label)
+            )  # include exact matches
+
+            # include this label when part of a list
+            sub_label_clauses.append((Event.sub_label.cast("char") % f"%{label},%"))
+            sub_label_clauses.append((Event.sub_label.cast("char") % f"%, {label}%"))
 
         sub_label_clause = reduce(operator.or_, sub_label_clauses)
         clauses.append((sub_label_clause))
@@ -633,7 +665,7 @@ def events():
             zone_clauses.append((Event.zones.length() == 0))
 
         for zone in filtered_zones:
-            zone_clauses.append((Event.zones.cast("text") % f'*"{zone}"*'))
+            zone_clauses.append((Event.zones.cast("char") % f'%"{zone}"%'))
 
         zone_clause = reduce(operator.or_, zone_clauses)
         clauses.append((zone_clause))
@@ -668,7 +700,7 @@ def events():
         Event.select(*selected_columns)
         .where(reduce(operator.and_, clauses))
         .order_by(Event.start_time.desc())
-        .limit(limit)
+        .limit(int(limit))
     )
 
     return jsonify([model_to_dict(e, exclude=excluded_fields) for e in events])
@@ -923,54 +955,53 @@ def get_recordings_storage_usage():
 def recordings_summary(camera_name):
     tz_name = request.args.get("timezone", default="utc", type=str)
     hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
+    print('hour='+hour_modifier[0]+'    -------- minute='+minute_modifier[0] + '----record=')
     recording_groups = (
         Recordings.select(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(               
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("hour"),
             fn.SUM(Recordings.duration).alias("duration"),
             fn.SUM(Recordings.motion).alias("motion"),
             fn.SUM(Recordings.objects).alias("objects"),
+
         )
         .where(Recordings.camera == camera_name)
         .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             )
         )
         .order_by(
-            fn.strftime(
-                "%Y-%m-%d H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).desc()
         )
     )
+    # print(recording_groups)
 
     event_groups = (
         Event.select(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("hour"),
             fn.COUNT(Event.id).alias("count"),
         )
         .where(Event.camera == camera_name, Event.has_clip)
         .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
+
             ),
         )
         .objects()
@@ -1131,20 +1162,30 @@ def vod_ts(camera_name, start_ts, end_ts):
 
         # Determine if we need to end the last clip early
         if recording.end_time > end_ts:
-            duration -= int((recording.end_time - end_ts) * 1000)
+            duration = duration - int((recording.end_time - end_ts) * 1000)
 
         if 0 < duration < max_duration_ms:
             clip["keyFrameDurations"] = [duration]
             clips.append(clip)
             durations.append(duration)
         else:
-            logger.warning(f"Recording clip is missing or empty: {recording.path}")
+            logger.warning(f"----Recording clip is missing or empty: {recording.path}")
 
     if not clips:
-        logger.error("No recordings found for the requested time range")
+        logger.error("-----No recordings found for the requested time range")
         return "No recordings found.", 404
 
     hour_ago = datetime.now() - timedelta(hours=1)
+    print(jsonify(
+        {
+            "cache": hour_ago.timestamp() > start_ts,
+            "discontinuity": False,
+            "consistentSequenceMediaInfo": True,
+            "durations": durations,
+            "segment_duration": max(durations),
+            "sequences": [{"clips": clips}],
+        }
+    ))
     return jsonify(
         {
             "cache": hour_ago.timestamp() > start_ts,
@@ -1170,12 +1211,12 @@ def vod_hour(year_month, day, hour, camera_name, tz_name):
     parts = year_month.split("-")
     start_date = (
         datetime(int(parts[0]), int(parts[1]), int(day), int(hour), tzinfo=timezone.utc)
-        - datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset()
+         - datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset()
     )
     end_date = start_date + timedelta(hours=1) - timedelta(milliseconds=1)
     start_ts = start_date.timestamp()
     end_ts = end_date.timestamp()
-
+    # print('-----------------------'+str(camera_name)+'---------------'+str(start_ts)+'----------'+str(end_ts))
     return vod_ts(camera_name, start_ts, end_ts)
 
 
@@ -1275,12 +1316,12 @@ def ffprobe():
         output.append(
             {
                 "return_code": ffprobe.returncode,
-                "stderr": json.loads(ffprobe.stderr.decode("unicode_escape").strip())
-                if ffprobe.stderr.decode()
-                else {},
+                "stderr": ffprobe.stderr.decode("unicode_escape").strip()
+                if ffprobe.returncode != 0
+                else "",
                 "stdout": json.loads(ffprobe.stdout.decode("unicode_escape").strip())
-                if ffprobe.stdout.decode()
-                else {},
+                if ffprobe.returncode == 0
+                else "",
             }
         )
 

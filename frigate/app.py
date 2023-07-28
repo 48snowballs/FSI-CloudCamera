@@ -13,6 +13,8 @@ import traceback
 from peewee_migrate import Router
 from playhouse.sqlite_ext import SqliteExtDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
+from playhouse.mysql_ext import MySQLConnectorDatabase
+from peewee import MySQLDatabase
 
 from frigate.comms.dispatcher import Communicator, Dispatcher
 from frigate.comms.mqtt import MqttClient
@@ -137,23 +139,28 @@ class FrigateApp:
 
     def init_database(self) -> None:
         # Migrate DB location
-        old_db_path = os.path.join(CLIPS_DIR, "frigate.db")
-        if not os.path.isfile(self.config.database.path) and os.path.isfile(
-            old_db_path
-        ):
-            os.rename(old_db_path, self.config.database.path)
+        # old_db_path = os.path.join(CLIPS_DIR, "frigate.db")
+        # if not os.path.isfile(self.config.database.path) and os.path.isfile(
+        #     old_db_path
+        # ):
+        #     os.rename(old_db_path, self.config.database.path)
 
-        # Migrate DB schema
-        migrate_db = SqliteExtDatabase(self.config.database.path)
+        # # Migrate DB schema
+        # migrate_db = SqliteExtDatabase(self.config.database.path)
 
-        # Run migrations
-        del logging.getLogger("peewee_migrate").handlers[:]
-        router = Router(migrate_db)
-        router.run()
+        # # Run migrations
+        # del logging.getLogger("peewee_migrate").handlers[:]
+        # router = Router(migrate_db)
+        # router.run()
 
-        migrate_db.close()
+        # migrate_db.close()
+        # self.db = MySQLDatabase('test', user='root', password='fsi2023', host='192.168.8.11',port=3306)
+        self.db = MySQLDatabase(self.config.mysqldb.db, user=self.config.mysqldb.user, password=self.config.mysqldb.password, host=self.config.mysqldb.host, port=self.config.mysqldb.port)
+        # router = Router(self.db)
+        # router.run()        
 
-        self.db = SqliteQueueDatabase(self.config.database.path)
+        # self.db = SqliteQueueDatabase(self.config.database.path)
+
         models = [Event, Recordings]
         self.db.bind(models)
 
@@ -428,7 +435,7 @@ class FrigateApp:
         self.recording_cleanup.join()
         self.stats_emitter.join()
         self.frigate_watchdog.join()
-        self.db.stop()
+        self.db.close()
 
         while len(self.detection_shms) > 0:
             shm = self.detection_shms.pop()

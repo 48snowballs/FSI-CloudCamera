@@ -16,7 +16,8 @@ module.exports = {
     ],
     Configuration: [
       "configuration/index",
-      "configuration/detectors",
+      "configuration/object_detectors",
+      "configuration/audio_detectors",
       "configuration/cameras",
       "configuration/masks",
       "configuration/record",
@@ -37,12 +38,14 @@ module.exports = {
       "integrations/home-assistant",
       "integrations/api",
       "integrations/mqtt",
+      "integrations/third_party_extensions",
     ],
     Troubleshooting: [
       "troubleshooting/faqs",
     ],
     Development: [
       "development/contributing",
+      "development/contributing-boards"
     ],
   },
 };

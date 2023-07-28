@@ -1,12 +1,16 @@
 import logging
+
 import numpy as np
+from pydantic import Field
+from typing_extensions import Literal
 
 from frigate.detectors.detection_api import DetectionApi
 from frigate.detectors.detector_config import BaseDetectorConfig
-from typing import Literal
-from pydantic import Extra, Field
-import tflite_runtime.interpreter as tflite
-from tflite_runtime.interpreter import load_delegate
+
+try:
+    from tflite_runtime.interpreter import Interpreter, load_delegate
+except ModuleNotFoundError:
+    from tensorflow.lite.python.interpreter import Interpreter, load_delegate
 
 
 logger = logging.getLogger(__name__)
@@ -23,18 +27,21 @@ class EdgeTpuTfl(DetectionApi):
     type_key = DETECTOR_KEY
 
     def __init__(self, detector_config: EdgeTpuDetectorConfig):
-        device_config = {"device": "usb"}
+        device_config = {}
         if detector_config.device is not None:
             device_config = {"device": detector_config.device}
 
         edge_tpu_delegate = None
 
         try:
-            logger.info(f"Attempting to load TPU as {device_config['device']}")
+            device_type = (
+                device_config["device"] if "device" in device_config else "auto"
+            )
+            logger.info(f"Attempting to load TPU as {device_type}")
             edge_tpu_delegate = load_delegate("libedgetpu.so.1.0", device_config)
             logger.info("TPU found")
-            self.interpreter = tflite.Interpreter(
-                model_path=detector_config.model.path or "/edgetpu_model.tflite",
+            self.interpreter = Interpreter(
+                model_path=detector_config.model.path,
                 experimental_delegates=[edge_tpu_delegate],
             )
         except ValueError:

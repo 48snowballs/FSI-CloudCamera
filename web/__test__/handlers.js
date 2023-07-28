@@ -16,7 +16,8 @@ export const handlers = [
           front: {
             name: 'front',
             objects: { track: ['taco', 'cat', 'dog'] },
-            record: { enabled: true },
+            audio: { enabled: false, enabled_in_config: false },
+            record: { enabled: true, enabled_in_config: true },
             detect: { width: 1280, height: 720 },
             snapshots: {},
             restream: { enabled: true, jsmpeg: { height: 720 } },
@@ -25,7 +26,8 @@ export const handlers = [
           side: {
             name: 'side',
             objects: { track: ['taco', 'cat', 'dog'] },
-            record: { enabled: false },
+            audio: { enabled: false, enabled_in_config: false },
+            record: { enabled: false, enabled_in_config: true },
             detect: { width: 1280, height: 720 },
             snapshots: {},
             restream: { enabled: true, jsmpeg: { height: 720 } },
