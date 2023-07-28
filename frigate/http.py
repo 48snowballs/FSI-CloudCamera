@@ -1,20 +1,23 @@
 import base64
+from datetime import datetime, timedelta, timezone
 import copy
 import glob
-import json
 import logging
+import json
 import os
 import subprocess as sp
+import pytz
 import time
 import traceback
-from datetime import datetime, timedelta, timezone
+
 from functools import reduce
 from pathlib import Path
+from tzlocal import get_localzone_name
 from urllib.parse import unquote
 
 import cv2
+
 import numpy as np
-import pytz
 from flask import (
     Blueprint,
     Flask,
@@ -24,27 +27,23 @@ from flask import (
     make_response,
     request,
 )
-from peewee import DoesNotExist, fn, operator
+
+from peewee import SqliteDatabase, operator, fn, DoesNotExist, MySQLDatabase
 from playhouse.shortcuts import model_to_dict
-from playhouse.sqliteq import SqliteQueueDatabase
-from tzlocal import get_localzone_name
 
 from frigate.config import FrigateConfig
-from frigate.const import CLIPS_DIR, CONFIG_DIR, MAX_SEGMENT_DURATION, RECORD_DIR
-from frigate.events.external import ExternalEventProcessor
-from frigate.models import Event, Recordings, Timeline
+from frigate.const import CLIPS_DIR, MAX_SEGMENT_DURATION, RECORD_DIR
+from frigate.models import Event, Recordings
 from frigate.object_processing import TrackedObject
-from frigate.plus import PlusApi
-from frigate.ptz.onvif import OnvifController
-from frigate.record.export import PlaybackFactorEnum, RecordingExporter
 from frigate.stats import stats_snapshot
-from frigate.storage import StorageMaintainer
-from frigate.util.builtin import (
+from frigate.util import (
     clean_camera_user_pass,
+    ffprobe_stream,
+    restart_frigate,
+    vainfo_hwaccel,
     get_tz_modifiers,
-    update_yaml_from_url,
 )
-from frigate.util.services import ffprobe_stream, restart_frigate, vainfo_hwaccel
+from frigate.storage import StorageMaintainer
 from frigate.version import VERSION
 
 logger = logging.getLogger(__name__)
@@ -54,13 +53,11 @@ bp = Blueprint("frigate", __name__)
 
 def create_app(
     frigate_config,
-    database: SqliteQueueDatabase,
+    database: MySQLDatabase,
     stats_tracking,
     detected_frames_processor,
     storage_maintainer: StorageMaintainer,
-    onvif: OnvifController,
-    external_processor: ExternalEventProcessor,
-    plus_api: PlusApi,
+    plus_api,
 ):
     app = Flask(__name__)
 
@@ -68,18 +65,18 @@ def create_app(
     def _db_connect():
         if database.is_closed():
             database.connect()
+        # database = MySQLDatabase(self.config.mysqldb.db, user=self.config.mysqldb.user, password=self.config.mysqldb.password, host=self.config.mysqldb.host, port=self.config.mysqldb.port)    
 
     @app.teardown_request
     def _db_close(exc):
         if not database.is_closed():
-            database.close()
+            database.close() 
+
 
     app.frigate_config = frigate_config
     app.stats_tracking = stats_tracking
     app.detected_frames_processor = detected_frames_processor
     app.storage_maintainer = storage_maintainer
-    app.onvif = onvif
-    app.external_processor = external_processor
     app.plus_api = plus_api
     app.camera_error_image = None
     app.hwaccel_errors = []
@@ -100,13 +97,12 @@ def events_summary():
     hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
     has_clip = request.args.get("has_clip", type=int)
     has_snapshot = request.args.get("has_snapshot", type=int)
-
     clauses = []
 
-    if has_clip is not None:
+    if not has_clip is None:
         clauses.append((Event.has_clip == has_clip))
 
-    if has_snapshot is not None:
+    if not has_snapshot is None:
         clauses.append((Event.has_snapshot == has_snapshot))
 
     if len(clauses) == 0:
@@ -117,11 +113,10 @@ def events_summary():
             Event.camera,
             Event.label,
             Event.sub_label,
-            fn.strftime(
-                "%Y-%m-%d",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("day"),
             Event.zones,
             fn.COUNT(Event.id).alias("count"),
@@ -131,11 +126,11 @@ def events_summary():
             Event.camera,
             Event.label,
             Event.sub_label,
-            fn.strftime(
-                "%Y-%m-%d",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ),
             Event.zones,
         )
@@ -184,20 +179,12 @@ def send_to_plus(id):
             400,
         )
 
-    include_annotation = (
-        request.json.get("include_annotation") if request.is_json else None
-    )
-
     try:
         event = Event.get(Event.id == id)
     except DoesNotExist:
         message = f"Event {id} not found"
         logger.error(message)
         return make_response(jsonify({"success": False, "message": message}), 404)
-
-    # events from before the conversion to relative dimensions cant include annotations
-    if event.data.get("box") is None:
-        include_annotation = None
 
     if event.end_time is None:
         logger.error(f"Unable to load clean png for in-progress event: {event.id}")
@@ -251,97 +238,7 @@ def send_to_plus(id):
     event.plus_id = plus_id
     event.save()
 
-    if include_annotation is not None:
-        box = event.data["box"]
-
-        try:
-            current_app.plus_api.add_annotation(
-                event.plus_id,
-                box,
-                event.label,
-            )
-        except Exception as ex:
-            logger.exception(ex)
-            return make_response(
-                jsonify({"success": False, "message": str(ex)}),
-                400,
-            )
-
     return make_response(jsonify({"success": True, "plus_id": plus_id}), 200)
-
-
-@bp.route("/events/<id>/false_positive", methods=("PUT",))
-def false_positive(id):
-    if not current_app.plus_api.is_active():
-        message = "PLUS_API_KEY environment variable is not set"
-        logger.error(message)
-        return make_response(
-            jsonify(
-                {
-                    "success": False,
-                    "message": message,
-                }
-            ),
-            400,
-        )
-
-    try:
-        event = Event.get(Event.id == id)
-    except DoesNotExist:
-        message = f"Event {id} not found"
-        logger.error(message)
-        return make_response(jsonify({"success": False, "message": message}), 404)
-
-    # events from before the conversion to relative dimensions cant include annotations
-    if event.data.get("box") is None:
-        message = "Events prior to 0.13 cannot be submitted as false positives"
-        logger.error(message)
-        return make_response(jsonify({"success": False, "message": message}), 400)
-
-    if event.false_positive:
-        message = "False positive already submitted to Frigate+"
-        logger.error(message)
-        return make_response(jsonify({"success": False, "message": message}), 400)
-
-    if not event.plus_id:
-        plus_response = send_to_plus(id)
-        if plus_response.status_code != 200:
-            return plus_response
-        # need to refetch the event now that it has a plus_id
-        event = Event.get(Event.id == id)
-
-    region = event.data["region"]
-    box = event.data["box"]
-
-    # provide top score if score is unavailable
-    score = (
-        (event.data["top_score"] if event.data["top_score"] else event.top_score)
-        if event.data["score"] is None
-        else event.data["score"]
-    )
-
-    try:
-        current_app.plus_api.add_false_positive(
-            event.plus_id,
-            region,
-            box,
-            score,
-            event.label,
-            event.model_hash,
-            event.model_type,
-            event.detector_type,
-        )
-    except Exception as ex:
-        logger.exception(ex)
-        return make_response(
-            jsonify({"success": False, "message": str(ex)}),
-            400,
-        )
-
-    event.false_positive = True
-    event.save()
-
-    return make_response(jsonify({"success": True, "plus_id": event.plus_id}), 200)
 
 
 @bp.route("/events/<id>/retain", methods=("DELETE",))
@@ -370,29 +267,18 @@ def set_sub_label(id):
             jsonify({"success": False, "message": "Event " + id + " not found"}), 404
         )
 
-    json: dict[str, any] = request.get_json(silent=True) or {}
-    new_sub_label = json.get("subLabel")
-    new_score = json.get("subLabelScore")
+    if request.json:
+        new_sub_label = request.json.get("subLabel")
+    else:
+        new_sub_label = None
 
-    if new_sub_label and len(new_sub_label) > 100:
+    if new_sub_label and len(new_sub_label) > 20:
         return make_response(
             jsonify(
                 {
                     "success": False,
                     "message": new_sub_label
-                    + " exceeds the 100 character limit for sub_label",
-                }
-            ),
-            400,
-        )
-
-    if new_score is not None and (new_score > 1.0 or new_score < 0):
-        return make_response(
-            jsonify(
-                {
-                    "success": False,
-                    "message": new_score
-                    + " does not fit within the expected bounds 0 <= score <= 1.0",
+                    + " exceeds the 20 character limit for sub_label",
                 }
             ),
             400,
@@ -406,15 +292,9 @@ def set_sub_label(id):
         )
 
         if tracked_obj:
-            tracked_obj.obj_data["sub_label"] = (new_sub_label, new_score)
+            tracked_obj.obj_data["sub_label"] = new_sub_label
 
     event.sub_label = new_sub_label
-
-    if new_score:
-        data = event.data
-        data["sub_label_score"] = new_score
-        event.data = data
-
     event.save()
     return make_response(
         jsonify(
@@ -427,24 +307,6 @@ def set_sub_label(id):
     )
 
 
-@bp.route("/labels")
-def get_labels():
-    camera = request.args.get("camera", type=str, default="")
-
-    try:
-        if camera:
-            events = Event.select(Event.label).where(Event.camera == camera).distinct()
-        else:
-            events = Event.select(Event.label).distinct()
-    except Exception as e:
-        return make_response(
-            jsonify({"success": False, "message": f"Failed to get labels: {e}"}), 404
-        )
-
-    labels = sorted([e.label for e in events])
-    return jsonify(labels)
-
-
 @bp.route("/sub_labels")
 def get_sub_labels():
     split_joined = request.args.get("split_joined", type=int)
@@ -452,9 +314,8 @@ def get_sub_labels():
     try:
         events = Event.select(Event.sub_label).distinct()
     except Exception as e:
-        return make_response(
-            jsonify({"success": False, "message": f"Failed to get sub_labels: {e}"}),
-            404,
+        return jsonify(
+            {"success": False, "message": f"Failed to get sub_labels: {e}"}, "404"
         )
 
     sub_labels = [e.sub_label for e in events]
@@ -471,7 +332,7 @@ def get_sub_labels():
                 parts = label.split(",")
 
                 for part in parts:
-                    if part.strip() not in sub_labels:
+                    if not (part.strip()) in sub_labels:
                         sub_labels.append(part.strip())
 
     sub_labels.sort()
@@ -510,7 +371,7 @@ def event_thumbnail(id, max_cache_age=2592000):
     event_complete = False
     try:
         event = Event.get(Event.id == id)
-        if event.end_time is not None:
+        if not event.end_time is None:
             event_complete = True
         thumbnail_bytes = base64.b64decode(event.thumbnail)
     except DoesNotExist:
@@ -520,9 +381,9 @@ def event_thumbnail(id, max_cache_age=2592000):
             for camera_state in camera_states:
                 if id in camera_state.tracked_objects:
                     tracked_obj = camera_state.tracked_objects.get(id)
-                    if tracked_obj is not None:
+                    if not tracked_obj is None:
                         thumbnail_bytes = tracked_obj.get_thumbnail()
-        except Exception:
+        except:
             return "Event not found", 404
 
     if thumbnail_bytes is None:
@@ -553,54 +414,28 @@ def event_thumbnail(id, max_cache_age=2592000):
     return response
 
 
-@bp.route("/timeline")
-def timeline():
-    camera = request.args.get("camera", "all")
-    source_id = request.args.get("source_id", type=str)
-    limit = request.args.get("limit", 100)
-
-    clauses = []
-
-    selected_columns = [
-        Timeline.timestamp,
-        Timeline.camera,
-        Timeline.source,
-        Timeline.source_id,
-        Timeline.class_type,
-        Timeline.data,
-    ]
-
-    if camera != "all":
-        clauses.append((Timeline.camera == camera))
-
-    if source_id:
-        clauses.append((Timeline.source_id == source_id))
-
-    if len(clauses) == 0:
-        clauses.append((True))
-
-    timeline = (
-        Timeline.select(*selected_columns)
-        .where(reduce(operator.and_, clauses))
-        .order_by(Timeline.timestamp.asc())
-        .limit(limit)
-    )
-
-    return jsonify([model_to_dict(t) for t in timeline])
-
-
 @bp.route("/<camera_name>/<label>/best.jpg")
 @bp.route("/<camera_name>/<label>/thumbnail.jpg")
 def label_thumbnail(camera_name, label):
     label = unquote(label)
-    event_query = Event.select(fn.MAX(Event.id)).where(Event.camera == camera_name)
-    if label != "any":
-        event_query = event_query.where(Event.label == label)
+    if label == "any":
+        event_query = (
+            Event.select()
+            .where(Event.camera == camera_name)
+            .order_by(Event.start_time.desc())
+        )
+    else:
+        event_query = (
+            Event.select()
+            .where(Event.camera == camera_name)
+            .where(Event.label == label)
+            .order_by(Event.start_time.desc())
+        )
 
     try:
-        event = event_query.scalar()
+        event = event_query.get()
 
-        return event_thumbnail(event, 60)
+        return event_thumbnail(event.id, 60)
     except DoesNotExist:
         frame = np.zeros((175, 175, 3), np.uint8)
         ret, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
@@ -633,7 +468,7 @@ def event_snapshot(id):
             for camera_state in camera_states:
                 if id in camera_state.tracked_objects:
                     tracked_obj = camera_state.tracked_objects.get(id)
-                    if tracked_obj is not None:
+                    if not tracked_obj is None:
                         jpg_bytes = tracked_obj.get_jpg_bytes(
                             timestamp=request.args.get("timestamp", type=int),
                             bounding_box=request.args.get("bbox", type=int),
@@ -641,9 +476,9 @@ def event_snapshot(id):
                             height=request.args.get("h", type=int),
                             quality=request.args.get("quality", default=70, type=int),
                         )
-        except Exception:
+        except:
             return "Event not found", 404
-    except Exception:
+    except:
         return "Event not found", 404
 
     if jpg_bytes is None:
@@ -783,9 +618,6 @@ def events():
         Event.retain_indefinitely,
         Event.sub_label,
         Event.top_score,
-        Event.false_positive,
-        Event.box,
-        Event.data,
     ]
 
     if camera != "all":
@@ -812,12 +644,12 @@ def events():
 
         for label in filtered_sub_labels:
             sub_label_clauses.append(
-                (Event.sub_label.cast("text") == label)
+                (Event.sub_label.cast("char") == label)
             )  # include exact matches
 
             # include this label when part of a list
-            sub_label_clauses.append((Event.sub_label.cast("text") % f"*{label},*"))
-            sub_label_clauses.append((Event.sub_label.cast("text") % f"*, {label}*"))
+            sub_label_clauses.append((Event.sub_label.cast("char") % f"%{label},%"))
+            sub_label_clauses.append((Event.sub_label.cast("char") % f"%, {label}%"))
 
         sub_label_clause = reduce(operator.or_, sub_label_clauses)
         clauses.append((sub_label_clause))
@@ -833,7 +665,7 @@ def events():
             zone_clauses.append((Event.zones.length() == 0))
 
         for zone in filtered_zones:
-            zone_clauses.append((Event.zones.cast("text") % f'*"{zone}"*'))
+            zone_clauses.append((Event.zones.cast("char") % f'%"{zone}"%'))
 
         zone_clause = reduce(operator.or_, zone_clauses)
         clauses.append((zone_clause))
@@ -844,13 +676,13 @@ def events():
     if before:
         clauses.append((Event.start_time < before))
 
-    if has_clip is not None:
+    if not has_clip is None:
         clauses.append((Event.has_clip == has_clip))
 
-    if has_snapshot is not None:
+    if not has_snapshot is None:
         clauses.append((Event.has_snapshot == has_snapshot))
 
-    if in_progress is not None:
+    if not in_progress is None:
         clauses.append((Event.end_time.is_null(in_progress)))
 
     if not include_thumbnails:
@@ -868,79 +700,10 @@ def events():
         Event.select(*selected_columns)
         .where(reduce(operator.and_, clauses))
         .order_by(Event.start_time.desc())
-        .limit(limit)
+        .limit(int(limit))
     )
 
     return jsonify([model_to_dict(e, exclude=excluded_fields) for e in events])
-
-
-@bp.route("/events/<camera_name>/<label>/create", methods=["POST"])
-def create_event(camera_name, label):
-    if not camera_name or not current_app.frigate_config.cameras.get(camera_name):
-        return make_response(
-            jsonify(
-                {"success": False, "message": f"{camera_name} is not a valid camera."}
-            ),
-            404,
-        )
-
-    if not label:
-        return make_response(
-            jsonify({"success": False, "message": f"{label} must be set."}), 404
-        )
-
-    json: dict[str, any] = request.get_json(silent=True) or {}
-
-    try:
-        frame = current_app.detected_frames_processor.get_current_frame(camera_name)
-
-        event_id = current_app.external_processor.create_manual_event(
-            camera_name,
-            label,
-            json.get("source_type", "api"),
-            json.get("sub_label", None),
-            json.get("score", 0),
-            json.get("duration", 30),
-            json.get("include_recording", True),
-            json.get("draw", {}),
-            frame,
-        )
-    except Exception as e:
-        return make_response(
-            jsonify({"success": False, "message": f"An unknown error occurred: {e}"}),
-            500,
-        )
-
-    return make_response(
-        jsonify(
-            {
-                "success": True,
-                "message": "Successfully created event.",
-                "event_id": event_id,
-            }
-        ),
-        200,
-    )
-
-
-@bp.route("/events/<event_id>/end", methods=["PUT"])
-def end_event(event_id):
-    json: dict[str, any] = request.get_json(silent=True) or {}
-
-    try:
-        end_time = json.get("end_time", datetime.now().timestamp())
-        current_app.external_processor.finish_manual_event(event_id, end_time)
-    except Exception:
-        return make_response(
-            jsonify(
-                {"success": False, "message": f"{event_id} must be set and valid."}
-            ),
-            404,
-        )
-
-    return make_response(
-        jsonify({"success": True, "message": "Event successfully ended."}), 200
-    )
 
 
 @bp.route("/config")
@@ -960,11 +723,6 @@ def config():
             cmd["cmd"] = clean_camera_user_pass(" ".join(cmd["cmd"]))
 
     config["plus"] = {"enabled": current_app.plus_api.is_active()}
-
-    for detector, detector_config in config["detectors"].items():
-        detector_config["model"][
-            "labelmap"
-        ] = current_app.frigate_config.model.merged_labelmap
 
     return jsonify(config)
 
@@ -1000,8 +758,8 @@ def config_save():
 
     # Validate the config schema
     try:
-        FrigateConfig.parse_raw(new_config)
-    except Exception:
+        new_yaml = FrigateConfig.parse_raw(new_config)
+    except Exception as e:
         return make_response(
             jsonify(
                 {
@@ -1025,12 +783,12 @@ def config_save():
         with open(config_file, "w") as f:
             f.write(new_config)
             f.close()
-    except Exception:
+    except Exception as e:
         return make_response(
             jsonify(
                 {
                     "success": False,
-                    "message": "Could not write config file, be sure that Frigate has write permission on the config file.",
+                    "message": f"Could not write config file, be sure that Frigate has write permission on the config file.",
                 }
             ),
             400,
@@ -1049,48 +807,6 @@ def config_save():
         )
     else:
         return "Config successfully saved.", 200
-
-
-@bp.route("/config/set", methods=["PUT"])
-def config_set():
-    config_file = os.environ.get("CONFIG_FILE", f"{CONFIG_DIR}/config.yml")
-
-    # Check if we can use .yaml instead of .yml
-    config_file_yaml = config_file.replace(".yml", ".yaml")
-
-    if os.path.isfile(config_file_yaml):
-        config_file = config_file_yaml
-
-    with open(config_file, "r") as f:
-        old_raw_config = f.read()
-        f.close()
-
-    try:
-        update_yaml_from_url(config_file, request.url)
-        with open(config_file, "r") as f:
-            new_raw_config = f.read()
-            f.close()
-        # Validate the config schema
-        try:
-            FrigateConfig.parse_raw(new_raw_config)
-        except Exception:
-            with open(config_file, "w") as f:
-                f.write(old_raw_config)
-                f.close()
-            return make_response(
-                jsonify(
-                    {
-                        "success": False,
-                        "message": f"\nConfig Error:\n\n{str(traceback.format_exc())}",
-                    }
-                ),
-                400,
-            )
-    except Exception as e:
-        logging.error(f"Error updating config: {e}")
-        return "Error updating config", 500
-
-    return "Config successfully updated, restart to apply", 200
 
 
 @bp.route("/config/schema.json")
@@ -1143,14 +859,6 @@ def mjpeg_feed(camera_name):
         return "Camera named {} not found".format(camera_name), 404
 
 
-@bp.route("/<camera_name>/ptz/info")
-def camera_ptz_info(camera_name):
-    if camera_name in current_app.frigate_config.cameras:
-        return jsonify(current_app.onvif.get_camera_info(camera_name))
-    else:
-        return "Camera named {} not found".format(camera_name), 404
-
-
 @bp.route("/<camera_name>/latest.jpg")
 def latest_frame(camera_name):
     draw_options = {
@@ -1167,14 +875,10 @@ def latest_frame(camera_name):
         frame = current_app.detected_frames_processor.get_current_frame(
             camera_name, draw_options
         )
-        retry_interval = float(
-            current_app.frigate_config.cameras.get(camera_name).ffmpeg.retry_interval
-            or 10
-        )
 
         if frame is None or datetime.now().timestamp() > (
             current_app.detected_frames_processor.get_current_frame_time(camera_name)
-            + retry_interval
+            + 10
         ):
             if current_app.camera_error_image is None:
                 error_image = glob.glob("/opt/frigate/frigate/images/camera-error.jpg")
@@ -1188,15 +892,6 @@ def latest_frame(camera_name):
 
         height = int(request.args.get("h", str(frame.shape[0])))
         width = int(height * frame.shape[1] / frame.shape[0])
-
-        if frame is None:
-            return "Unable to get valid frame from {}".format(camera_name), 500
-
-        if height < 1 or width < 1:
-            return (
-                "Invalid height / width requested :: {} / {}".format(height, width),
-                400,
-            )
 
         frame = cv2.resize(frame, dsize=(width, height), interpolation=cv2.INTER_AREA)
 
@@ -1227,53 +922,6 @@ def latest_frame(camera_name):
         return response
     else:
         return "Camera named {} not found".format(camera_name), 404
-
-
-@bp.route("/<camera_name>/recordings/<frame_time>/snapshot.png")
-def get_snapshot_from_recording(camera_name: str, frame_time: str):
-    if camera_name not in current_app.frigate_config.cameras:
-        return "Camera named {} not found".format(camera_name), 404
-
-    frame_time = float(frame_time)
-    recording_query = (
-        Recordings.select()
-        .where(
-            ((frame_time > Recordings.start_time) & (frame_time < Recordings.end_time))
-        )
-        .where(Recordings.camera == camera_name)
-    )
-
-    try:
-        recording: Recordings = recording_query.get()
-        time_in_segment = frame_time - recording.start_time
-
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-ss",
-            f"00:00:{time_in_segment}",
-            "-i",
-            recording.path,
-            "-frames:v",
-            "1",
-            "-c:v",
-            "png",
-            "-f",
-            "image2pipe",
-            "-",
-        ]
-
-        process = sp.run(
-            ffmpeg_cmd,
-            capture_output=True,
-        )
-        response = make_response(process.stdout)
-        response.headers["Content-Type"] = "image/png"
-        return response
-    except DoesNotExist:
-        return "Recording not found for {} at {}".format(camera_name, frame_time), 404
 
 
 @bp.route("/recordings/storage", methods=["GET"])
@@ -1307,54 +955,53 @@ def get_recordings_storage_usage():
 def recordings_summary(camera_name):
     tz_name = request.args.get("timezone", default="utc", type=str)
     hour_modifier, minute_modifier = get_tz_modifiers(tz_name)
+    print('hour='+hour_modifier[0]+'    -------- minute='+minute_modifier[0] + '----record=')
     recording_groups = (
         Recordings.select(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(               
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("hour"),
             fn.SUM(Recordings.duration).alias("duration"),
             fn.SUM(Recordings.motion).alias("motion"),
             fn.SUM(Recordings.objects).alias("objects"),
+
         )
         .where(Recordings.camera == camera_name)
         .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             )
         )
         .order_by(
-            fn.strftime(
-                "%Y-%m-%d H",
-                fn.datetime(
-                    Recordings.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Recordings.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).desc()
         )
     )
+    # print(recording_groups)
 
     event_groups = (
         Event.select(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
             ).alias("hour"),
             fn.COUNT(Event.id).alias("count"),
         )
         .where(Event.camera == camera_name, Event.has_clip)
         .group_by(
-            fn.strftime(
-                "%Y-%m-%d %H",
-                fn.datetime(
-                    Event.start_time, "unixepoch", hour_modifier, minute_modifier
-                ),
+            fn.DATE_FORMAT(
+                fn.FROM_UNIXTIME(
+                    Event.start_time + int(hour_modifier[0])*60*60
+                ),"%Y-%m-%d %H"
+
             ),
         )
         .objects()
@@ -1446,7 +1093,6 @@ def recording_clip(camera_name, start_ts, end_ts):
     if not os.path.exists(path):
         ffmpeg_cmd = [
             "ffmpeg",
-            "-hide_banner",
             "-y",
             "-protocol_whitelist",
             "pipe,file",
@@ -1516,20 +1162,30 @@ def vod_ts(camera_name, start_ts, end_ts):
 
         # Determine if we need to end the last clip early
         if recording.end_time > end_ts:
-            duration -= int((recording.end_time - end_ts) * 1000)
+            duration = duration - int((recording.end_time - end_ts) * 1000)
 
         if 0 < duration < max_duration_ms:
             clip["keyFrameDurations"] = [duration]
             clips.append(clip)
             durations.append(duration)
         else:
-            logger.warning(f"Recording clip is missing or empty: {recording.path}")
+            logger.warning(f"----Recording clip is missing or empty: {recording.path}")
 
     if not clips:
-        logger.error("No recordings found for the requested time range")
+        logger.error("-----No recordings found for the requested time range")
         return "No recordings found.", 404
 
     hour_ago = datetime.now() - timedelta(hours=1)
+    print(jsonify(
+        {
+            "cache": hour_ago.timestamp() > start_ts,
+            "discontinuity": False,
+            "consistentSequenceMediaInfo": True,
+            "durations": durations,
+            "segment_duration": max(durations),
+            "sequences": [{"clips": clips}],
+        }
+    ))
     return jsonify(
         {
             "cache": hour_ago.timestamp() > start_ts,
@@ -1555,12 +1211,12 @@ def vod_hour(year_month, day, hour, camera_name, tz_name):
     parts = year_month.split("-")
     start_date = (
         datetime(int(parts[0]), int(parts[1]), int(day), int(hour), tzinfo=timezone.utc)
-        - datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset()
+         - datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset()
     )
     end_date = start_date + timedelta(hours=1) - timedelta(milliseconds=1)
     start_ts = start_date.timestamp()
     end_ts = end_date.timestamp()
-
+    # print('-----------------------'+str(camera_name)+'---------------'+str(start_ts)+'----------'+str(end_ts))
     return vod_ts(camera_name, start_ts, end_ts)
 
 
@@ -1603,22 +1259,6 @@ def vod_event(id):
     )
 
 
-@bp.route("/export/<camera_name>/start/<start_time>/end/<end_time>", methods=["POST"])
-def export_recording(camera_name: str, start_time: int, end_time: int):
-    playback_factor = request.get_json(silent=True).get("playback", "realtime")
-    exporter = RecordingExporter(
-        current_app.frigate_config,
-        camera_name,
-        int(start_time),
-        int(end_time),
-        PlaybackFactorEnum[playback_factor]
-        if playback_factor in PlaybackFactorEnum.__members__.values()
-        else PlaybackFactorEnum.realtime,
-    )
-    exporter.start()
-    return "Starting export of recording", 200
-
-
 def imagestream(detected_frames_processor, camera_name, fps, height, draw_options):
     while True:
         # max out at specified FPS
@@ -1642,24 +1282,21 @@ def ffprobe():
     path_param = request.args.get("paths", "")
 
     if not path_param:
-        return make_response(
-            jsonify({"success": False, "message": "Path needs to be provided."}), 404
+        return jsonify(
+            {"success": False, "message": f"Path needs to be provided."}, "404"
         )
 
     if path_param.startswith("camera"):
         camera = path_param[7:]
 
         if camera not in current_app.frigate_config.cameras.keys():
-            return make_response(
-                jsonify(
-                    {"success": False, "message": f"{camera} is not a valid camera."}
-                ),
-                404,
+            return jsonify(
+                {"success": False, "message": f"{camera} is not a valid camera."}, "404"
             )
 
         if not current_app.frigate_config.cameras[camera].enabled:
-            return make_response(
-                jsonify({"success": False, "message": f"{camera} is not enabled."}), 404
+            return jsonify(
+                {"success": False, "message": f"{camera} is not enabled."}, "404"
             )
 
         paths = map(
